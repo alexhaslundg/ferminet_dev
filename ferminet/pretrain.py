@@ -23,6 +23,7 @@ from ferminet import mcmc
 from ferminet import networks
 from ferminet.utils import scf
 from ferminet.utils import system
+from ferminet.utils import writers
 import jax
 from jax import numpy as jnp
 import kfac_jax
@@ -276,6 +277,7 @@ def pretrain_hartree_fock(
     logger: Callable[[int, float], None] | None = None,
     scf_fraction: float = 0.0,
     states: int = 0,
+    ckpt_save_path: str = './',
 ):
   """Performs training to match initialization as closely as possible to HF.
 
@@ -336,12 +338,32 @@ def pretrain_hartree_fock(
   data = networks.FermiNetData(
       positions=positions, spins=pmap_spins, atoms=atoms, charges=charges
   )
-
-  for t in range(iterations):
-    sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
-    data, params, opt_state_pt, loss, pmove = pretrain_step(
-        data, params, opt_state_pt, subkeys, scf_approx)
-    logging.info('Pretrain iter %05d: %g %g', t, loss[0], pmove[0])
-    if logger:
-      logger(t, loss[0])
+  # collect pretraining statistics for logging
+  pre_train_schema = ['step', 'energy', 'pmove']
+  writer_manager = writers.Writer(
+      name='pretrain_stats',
+      schema=pre_train_schema,
+      directory=ckpt_save_path,
+      iteration_key=None,
+      log=False)
+  with writer_manager as writer:
+      # --------------------------------
+    for t in range(iterations):
+      sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
+      data, params, opt_state_pt, loss, pmove = pretrain_step(
+          data, params, opt_state_pt, subkeys, scf_approx)
+      logging.info('Pretrain iter %05d: %g %g', t, loss[0], pmove[0])
+      writer_kwargs = {
+            'step': t,
+            'energy': np.asarray(loss)[0],
+            'pmove': np.asarray(pmove)[0],
+        }
+      writer.write(t, **writer_kwargs)
+      if logger:
+        logger(t, loss[0])
+  
   return params, data.positions
+
+
+
+
