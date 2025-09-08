@@ -19,7 +19,7 @@ import importlib
 import os
 import time
 from typing import Optional, Mapping, Sequence, Tuple, Union
-
+import json
 from absl import logging
 import chex
 from ferminet import checkpoint
@@ -46,6 +46,50 @@ import numpy as np
 import optax
 from typing_extensions import Protocol
 
+## Adding function to save config info 
+from datetime import datetime
+from typing import Any, Dict
+import ml_collections
+
+def save_config_to_file(cfg: ml_collections.ConfigDict, key: chex.PRNGKey, core_electrons) -> str:
+    """
+    Saves the configuration and JAX key to a JSON file with timestamp.
+    
+    Args:
+        cfg: ConfigDict containing training parameters
+        key: JAX PRNG key used for initialization
+        
+    Returns:
+        Path to saved configuration file
+    """
+    # Create directory if it doesn't exist
+    os.makedirs(cfg.log.save_path, exist_ok=True)
+    
+    # Generate timestamp for unique filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"config.json"
+    filepath = os.path.join(cfg.log.save_path, filename)
+    
+    # Convert ConfigDict to regular dict for serialization
+    config_dict = cfg.to_dict()
+    
+    # Add the key to the config dictionary
+    config_dict["jax_key"] = key.tolist()  # Convert JAX array to Python list
+    config_dict["core_electrons"] = core_electrons  # Add core electrons mapping
+    
+    # Custom JSON encoder to handle non-serializable objects
+    def json_encoder(obj):
+        if hasattr(obj, '__dict__'):
+            return str(obj)
+        elif callable(obj):
+            return f"<function: {obj.__name__}>"
+        else:
+            return str(obj)
+    
+    with open(filepath, 'w') as f:
+        json.dump(config_dict, f, indent=2, default=json_encoder)
+    
+    return filepath
 
 def _assign_spin_configuration(
     nalpha: int, nbeta: int, batch_size: int = 1
@@ -385,6 +429,95 @@ def make_kfac_training_step(
 
   return step
 
+def estimate_qgt(
+    optimizer: kfac_jax.Optimizer,
+    opt_state: kfac_jax.Optimizer.State,
+    params,
+    batch: networks.FermiNetData,
+    rng,
+    damping: float,
+    estimation_mode: str = "fisher_exact"
+):
+    """Estimates the curvature matrix (e.g., Fisher or GGN) using KFAC-JAX.
+
+    Args:
+        optimizer: The KFAC-JAX optimizer instance containing the curvature estimator.
+        opt_state: The current optimizer state, including the estimator state.
+        params: Model parameters (e.g., a PyTree of arrays).
+        batch: A FermiNetData dataclass or its JAX-transformed equivalent (e.g., a PyTree
+            with positions, spins, atoms, and charges).
+        rng: JAX PRNG key for stochastic estimation.
+        damping: Damping factor (identity_weight) to regularize the curvature matrix.
+        estimation_mode: Curvature estimation mode (e.g., 'fisher_exact', 'ggn_exact').
+
+    Returns:
+        tuple: (curvature_matrix, updated_opt_state)
+            - curvature_matrix: Dense curvature matrix as a JAX array.
+            - updated_opt_state: Optimizer state with updated estimator state.
+
+    Raises:
+        ValueError: If batch lacks a positions array or has an unexpected structure.
+    """
+    print("batch", batch.keys(), type(batch))
+    # Extract positions array from batch (handle JAX-transformed PyTree)
+    batch_size = batch['positions'].shape[1]
+    try:
+      print("batch size: ", batch['positions'].shape[1])
+    except KeyError:
+      raise ValueError("Batch must contain a positions array")
+
+    # Construct func_args as (params, batch, rng) to match optimizer.step
+    func_args = (params, batch, rng)
+
+    # Update the curvature matrix estimate
+    estimator_state = optimizer.estimator.update_curvature_matrix_estimate(
+        state=opt_state.estimator_state,
+        ema_old=optimizer._curvature_ema,
+        ema_new=1.0 - optimizer._curvature_ema,
+        batch_size=batch_size,
+        rng=rng,
+        func_args=func_args,
+        estimation_mode=estimation_mode,
+        identity_weight=damping
+    )
+
+    # Update the optimizer state with the new estimator state
+    opt_state = opt_state._replace(estimator_state=estimator_state)
+
+    # Compute the dense curvature matrix
+    curvature_matrix = optimizer.estimator.to_dense_matrix(estimator_state)
+
+    return curvature_matrix, opt_state
+
+# ------------ CONVERGENCE CHECKS ------------
+def _calculate_slope(loss_vals: np.ndarray) -> float:
+    """Calculate slope using least squares linear regression."""
+    n = len(loss_vals)
+    x = np.arange(n)
+    y = loss_vals
+    slope = (n * np.sum(x * y) - np.sum(x) * np.sum(y)) / (n * np.sum(x**2) - np.sum(x)**2)
+    return slope
+
+def _calculate_variance(loss_vals: np.ndarray) -> float:
+    """Calculate variance of the loss values."""
+    return np.var(loss_vals)
+
+def _check_convergence(loss_vals: np.ndarray, convergence_window: int = 200, slope_threshold: float = 0.01, variance_threshold: float = 1.6e-3) -> bool:
+    """Check if the convergence criteria are met."""
+    if len(loss_vals) < convergence_window:
+        print("Not enough data points for convergence check.")
+        return False
+    else:
+        loss_vals = loss_vals[-convergence_window:]  # Use only the last 'convergence_window' values
+    slope = _calculate_slope(loss_vals)
+    variance = _calculate_variance(loss_vals)
+    if slope < abs(slope_threshold) and variance < abs(variance_threshold):
+        logging.info(
+            'Convergence check passed: slope = %.6f, variance = %.6f',
+            slope, variance
+        )
+        return True, slope, variance
+    return False, slope, variance
 
 def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   """Runs training loop for QMC.
@@ -418,6 +551,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     cfg.update(
         system.pyscf_mol_to_internal_representation(cfg.system.pyscf_mol))
 
+
   # Convert mol config into array of atomic positions and charges
   atoms = jnp.stack([jnp.array(atom.coords) for atom in cfg.system.molecule])
   charges = jnp.array([atom.charge for atom in cfg.system.molecule])
@@ -431,10 +565,16 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
 
   if cfg.debug.deterministic:
     seed = 23
+  if cfg.debug.seed != 0: # if providing a specifc seed, use this one instead.
+    seed_start = cfg.debug.seed
+    seed = jnp.asarray([1e6 * seed_start])
+    seed = int(multihost_utils.broadcast_one_to_all(seed)[0])
   else:
     seed = jnp.asarray([1e6 * time.time()])
     seed = int(multihost_utils.broadcast_one_to_all(seed)[0])
   key = jax.random.PRNGKey(seed)
+
+
 
   # extract number of electrons of each spin around each atom removed because
   # of pseudopotentials
@@ -449,8 +589,13 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     ecp = {}
     core_electrons = {}
 
-  # Create parameters, network, and vmaped/pmaped derivations
+   # Save configuration to file
+  config_path = save_config_to_file(cfg, key, core_electrons) # adding the key as a parameter
+  print(f"Configuration saved to: {config_path}")
 
+
+
+  # Create parameters, network, and vmaped/pmaped derivations
   if cfg.pretrain.method == 'hf' and cfg.pretrain.iterations > 0:
     hartree_fock = pretrain.get_hf(
         pyscf_mol=cfg.system.get('pyscf_mol'),
@@ -461,7 +606,9 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         ecp=ecp,
         core_electrons=core_electrons,
         states=cfg.system.states,
-        excitation_type=cfg.pretrain.get('excitation_type', 'ordered'))
+        excitation_type=cfg.pretrain.get('excitation_type', 'ordered'),
+    )
+
     # broadcast the result of PySCF from host 0 to all other hosts
     hartree_fock.mean_field.mo_coeff = multihost_utils.broadcast_one_to_all(
         hartree_fock.mean_field.mo_coeff
@@ -589,6 +736,13 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   ckpt_save_path = checkpoint.create_save_path(cfg.log.save_path)
   ckpt_restore_path = checkpoint.get_restore_path(cfg.log.restore_path)
 
+    # Add this before the main training loop (after the checkpoint restoration section)
+  if cfg.log.get('save_positions_frequency', 0) > 0:
+      positions_save_path = os.path.join(ckpt_save_path, 'electron_positions')
+      if not os.path.exists(positions_save_path):
+          os.makedirs(positions_save_path)
+      logging.info(f'Will save electron positions every {cfg.log.save_positions_frequency} iterations to {positions_save_path}')
+
   ckpt_restore_filename = (
       checkpoint.find_last_checkpoint(ckpt_save_path) or
       checkpoint.find_last_checkpoint(ckpt_restore_path))
@@ -604,6 +758,8 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   else:
     logging.info('No checkpoint found. Training new model.')
     key, subkey = jax.random.split(key)
+    logging.info('Using seed %s for initialization.', subkey)
+    logging.info('subkey %s', key)
     # make sure data on each host is initialized differently
     subkey = jax.random.fold_in(subkey, jax.process_index())
     # create electron state (position and spin)
@@ -632,7 +788,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     density_state_ckpt = None
 
   # Set up logging and observables
-  train_schema = ['step', 'energy', 'ewmean', 'ewvar', 'pmove']
+  train_schema = ['step', 'energy', 'ewmean', 'ewvar', 'pmove',"mcmc_width", "convergence_slope", "convergence_variance", "early_convergence"] ## CHANGED THIS!
 
   if cfg.system.states:
     energy_matrix_file = open(
@@ -714,6 +870,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         batch_size=device_batch_size,
         scf_fraction=cfg.pretrain.get('scf_fraction', 0.0),
         states=cfg.system.states,
+        ckpt_save_path=cfg.log.save_path
     )
 
   # Main training
@@ -926,7 +1083,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
 
   time_of_last_ckpt = time.time()
   weighted_stats = None
-
+  """------------------This is the Inference Code------------------"""
   if cfg.optim.optimizer == 'none' and opt_state_ckpt is not None:
     # If opt_state_ckpt is None, then we're restarting from a previous inference
     # run (most likely due to preemption) and so should continue from the last
@@ -963,8 +1120,9 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         iteration_key=None,
         log=False)
   with writer_manager as writer:
-    # Main training loop
+    # ------------------------------------- Main training loop -------------------------------------
     num_resets = 0  # used if reset_if_nan is true
+    previous_loss = []
     for t in range(t_init, cfg.optim.iterations):
       sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
       data, params, opt_state, loss, aux_data, pmove = step(
@@ -974,9 +1132,26 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
           subkeys,
           mcmc_width)
 
+      # Save electron positions every n iterations
+      if (cfg.log.get('save_positions_frequency', 0) > 0 and 
+          t % cfg.log.save_positions_frequency == 0):
+          
+          # Get positions from all devices and save
+          # data.positions shape is typically (num_devices, device_batch_size, num_states * num_electrons, 3)
+          positions_to_save = np.array(data.positions)
+          
+          # Save with iteration number in filename
+          positions_filename = os.path.join(positions_save_path, f'positions_step_{t:06d}.npy')
+          np.save(positions_filename, positions_to_save)
+          
+          logging.info(f'Saved electron positions at step {t} to {positions_filename}')
+          logging.info(f'Positions shape: {positions_to_save.shape}')
+
       # due to pmean, loss, and pmove should be the same across
       # devices.
       loss = loss[0]
+      previous_loss.append(loss)
+
       # per batch variance isn't informative. Use weighted mean and variance
       # instead.
       weighted_stats = statistics.exponentialy_weighted_stats(
@@ -992,7 +1167,6 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
         observable_states['density'] = density_update(
             subkeys, params, data, observable_states['density'])
-
       # Update MCMC move width
       mcmc_width, pmoves = mcmc.update_mcmc_width(
           t, mcmc_width, cfg.mcmc.adapt_frequency, pmove, pmoves)
@@ -1011,8 +1185,31 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
               raise e
           else:
             raise e
+          
 
-      # Logging
+    # try saving the data.positions data every n iterations 
+
+      # # # trying to save the QGT 
+      # # # Estimate QGT
+      # qgt, opt_state = estimate_qgt(optimizer, opt_state, params, data, subkeys[0], cfg.optim.kfac.damping)
+      # qgt_trace = jnp.trace(qgt)
+      # print(f"QGT trace: {qgt_trace:.4f}")
+      # np.save(os.path.join(cfg.log.save_path, f"qgt_step_{t}.npy"), qgt)
+      # # Logging
+
+      # --------------- check convergence ---------------
+      # check for early stopping: if the loss has not improved in the last n iterations, stop training
+      # DISABLED FOR HYPERPARAMETER SEARCH
+      early_convergence = False
+      loss_slope = None
+      loss_var = None
+      if len(previous_loss) > cfg.optim.convergence.convergence_window:
+        early_convergence, loss_slope, loss_var = _check_convergence(
+            np.array(previous_loss),
+            convergence_window=cfg.optim.convergence.convergence_window,
+            slope_threshold=cfg.optim.convergence.early_stopping_slope_threshold,
+            variance_threshold=cfg.optim.convergence.early_stopping_var_threshold)
+      
       if t % cfg.log.stats_frequency == 0:
         logging_str = ('Step %05d: '
                        '%03.4f E_h, exp. variance=%03.4f E_h^2, pmove=%0.2f')
@@ -1023,6 +1220,10 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
             'ewmean': np.asarray(weighted_stats.mean),
             'ewvar': np.asarray(weighted_stats.variance),
             'pmove': np.asarray(pmove),
+            'mcmc_width': np.asarray(mcmc_width)[0],
+            "convergence_slope": np.asarray(loss_slope) if 'loss_slope' in locals() else None,
+            "convergence_variance": np.asarray(loss_var) if 'loss_var' in locals() else None,
+            "early_convergence": early_convergence if 'early_convergence' in locals() else None
         }
         for key in observable_data:
           obs_data = observable_data[key]
@@ -1053,10 +1254,36 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
       if cfg.observables.density:
         np.save(density_matrix_file, observable_data['density'])
 
+      if early_convergence == True:
+        logging.info('Early stopping triggered at step %d', t)
+        if cfg.log.save_last_iteration:
+          logging.info('Early Stopping - Saving final checkpoint.')
+          checkpoint.save(ckpt_save_path, t, data, params, opt_state, mcmc_width)
+        break
+      
       # Checkpointing
       if time.time() - time_of_last_ckpt > cfg.log.save_frequency * 60:
         checkpoint.save(ckpt_save_path, t, data, params, opt_state, mcmc_width)
         time_of_last_ckpt = time.time()
+      
+      # save checkpoint at the end of training
+      if t == cfg.optim.iterations - 1 or early_convergence:
+        if cfg.log.save_last_iteration:
+          logging.info('Saving final checkpoint.')
+          if early_convergence:
+            logging.info('Early Stopping - Saving final checkpoint.')
+          checkpoint.save(ckpt_save_path, t, data, params, opt_state, mcmc_width)
+
+      if cfg.log.save_intermediate_walker_frequency > 0 and t % cfg.log.save_intermediate_walker_frequency == 0:
+        logging.info('Saving checkpoint at step %d', t)
+        # intermediate checkpoints are saved in a different path
+        intermediate_ckpt_save_path = f"{ckpt_save_path}/intermediate"
+        # If the intermediate checkpoint path does not exist, create it
+        if not os.path.exists(intermediate_ckpt_save_path):
+          os.makedirs(intermediate_ckpt_save_path)
+        # Save the intermediate checkpoint with the current step
+        logging.info('Saving intermediate checkpoint at step %d', t)
+        checkpoint.save(intermediate_ckpt_save_path, t, data, params, opt_state, mcmc_width)
 
     # Shut down logging at end
     if cfg.system.states:
@@ -1067,3 +1294,4 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         dipole_matrix_file.close()
     if cfg.observables.density:
       density_matrix_file.close()
+

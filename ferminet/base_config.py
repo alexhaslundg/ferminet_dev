@@ -44,7 +44,7 @@ def default() -> ml_collections.ConfigDict:
   """
   # wavefunction output.
   cfg = ml_collections.ConfigDict({
-      'batch_size': 4096,  # batch size
+      'batch_size': 10, #4096,  # batch size
       # Config module used. Should be set in get_config function as either the
       # absolute module or relative to the configs subdirectory. Relative
       # imports must start with a '.' (e.g. .atom). Do *not* override on
@@ -58,7 +58,7 @@ def default() -> ml_collections.ConfigDict:
           # 'wqmc': minimise <H> by Wasserstein QMC
           # 'vmc_overlap': minimize \sum_i <H_i> + \lambda \sum_ij <psi_i psi_j>
           'objective': 'vmc',
-          'iterations': 1000000,  # number of iterations
+          'iterations': 2000,  # number of iterations
           'optimizer': 'kfac',  # one of adam, kfac, lamb, none
           'laplacian': 'default',  # of of default or folx (for forward lapl)
           # If 0, use standard vmap. If >0, the max batch size for batched_vmap
@@ -97,6 +97,12 @@ def default() -> ml_collections.ConfigDict:
               'weights': None,
               # Strength of the penalty term
               'penalty': 1.0,
+            },
+            "convergence": {
+              "check_convergence": True,  # whether to check convergence
+              'convergence_window': 200,  # window size for average loss
+              'early_stopping_var_threshold': 1.6e-3,  # threshold for early stopping (default is 1.6 milli Ha)
+              'early_stopping_slope_threshold': 1e-4,  # threshold for early stopping slope
           },
           # KFAC hyperparameters. See KFAC documentation for details.
           'kfac': {
@@ -124,6 +130,7 @@ def default() -> ml_collections.ConfigDict:
       'log': {
           'stats_frequency': 1,  # iterations between logging of stats
           'save_frequency': 10.0,  # minutes between saving network params
+          'save_last_iteration': False,
           # Path to save/restore network to/from. If falsy,
           # creates a timestamped directory in the working directory.
           'save_path': '',
@@ -134,6 +141,7 @@ def default() -> ml_collections.ConfigDict:
           # to log the values of all walkers every iteration Use with caution!!!
           # Produces a lot of data very quickly.
           'walkers': False,
+          'save_intermediate_walker_frequency': -1, # how often to save walkers (for debugging training and visualisation of final models.)
           # Whether or not to log all local energies for each walker at each
           # step
           'local_energies': False,
@@ -141,6 +149,7 @@ def default() -> ml_collections.ConfigDict:
           # wavefunction dependent on using log_energy mode or not for each
           # walker at each step
           'features': False,
+          "save_positions_frequency": 10
       },
       'system': {
           'type': SystemType.MOLECULE.value,
@@ -221,7 +230,7 @@ def default() -> ml_collections.ConfigDict:
           'blocks': 1,  # Number of blocks to split the MCMC sampling into
       },
       'network': {
-          'network_type': 'ferminet',  # One of 'ferminet' or 'psiformer'.
+          'network_type': 'psiformer',  # One of 'ferminet' or 'psiformer'.
           # If true, the network outputs complex numbers rather than real.
           'complex': False,
           # Config specific to original FermiNet architecture.
@@ -306,10 +315,11 @@ def default() -> ml_collections.ConfigDict:
           # NaN is found.
           'check_nan': False,
           'deterministic': False,  # Use a deterministic seed.
+          'seed': 0,  # Seed for random number generation.
       },
       'pretrain': {
           'method': 'hf',  # Currently only 'hf' is supported.
-          'iterations': 1000,  # Only used if method is 'hf'.
+          'iterations': 100,  # Only used if method is 'hf'.
           'basis': 'ccpvdz',  # Larger than STO-6G, but good for excited states
           # Fraction of SCF to use in pretraining MCMC. This enables pretraining
           # similar to the original FermiNet paper.
