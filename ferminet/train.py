@@ -422,7 +422,7 @@ def make_kfac_training_step(
         damping=shared_damping,
     )
 
-    if reset_if_nan and jnp.isnan(stats['loss']):
+    if reset_if_nan and jnp.any(jnp.isnan(stats['loss'])):
       new_params = old_params
       new_state = old_state
     return data, new_params, new_state, stats['loss'], stats['aux'], pmove
@@ -1040,7 +1040,8 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   elif isinstance(optimizer, optax.GradientTransformation):
     # optax/optax-compatible optimizer (ADAM, LAMB, ...)
     opt_state = jax.pmap(optimizer.init)(params)
-    opt_state = opt_state_ckpt or opt_state  # avoid overwriting ckpted state
+    if opt_state_ckpt is not None:
+      opt_state = tuple(opt_state_ckpt)
     step = make_training_step(
         mcmc_step=mcmc_step,
         optimizer_step=make_opt_update_step(evaluate_loss, optimizer),
